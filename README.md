@@ -150,25 +150,25 @@ We will evaluate the generated test data using two metrics: 1) instance segmenta
   - Convert point-wise instance labels (`id > 0`) to binary instance masks.
   - Compute the pairwise IoU matrix between predicted and GT masks.
   - Run Hungarian matching (1-to-1 assignment) using cost `1 - IoU`.
-  - For each IoU threshold `\tau`, count:
-    - `TP_\tau`: matched pairs with `IoU \ge \tau`
-    - `FP_\tau`: predicted instances not counted as TP
-    - `FN_\tau`: GT instances not counted as TP
+  - For each IoU threshold $\tau$, count:
+    - $TP_\tau$: matched pairs with $IoU \ge \tau$
+    - $FP_\tau$: predicted instances not counted as TP
+    - $FN_\tau$: GT instances not counted as TP
 
-- For each threshold `\tau`, compute:
-    $
+- For each threshold $\tau$, compute:
+    $$
     F1_{\tau} = \frac{2 TP_{\tau}}{2 TP_{\tau} + FP_{\tau} + FN_{\tau}}
-    $
-  where `TP_\tau`, `FP_\tau`, and `FN_\tau` are aggregated over all scenes.
+    $$
+  where $TP_\tau$, $FP_\tau$, and $FN_\tau$ are aggregated over all scenes.
 
 - We report:
-  - `F1@25` = $F1_{\tau=0.25}$
-  - `F1@95` = $F1_{\tau=0.95}$
-  - `F1@50:90:05` = $\frac{1}{9}\sum_{\tau \in \{0.50,0.55,\dots,0.90\}} F1_\tau$
+  - $F1_{0.25}$
+  - $F1_{0.95}$
+  - $F1_{0.50:0.90:0.05} = \frac{1}{9}\sum_{\tau \in \{0.50,0.55,\dots,0.90\}} F1_\tau$
 
 - Final instance score:
   $$
-  \text{Instance Score} = 0.25 \times \text{F1@25} + 0.5 \times \text{F1@50:90:05} + 0.25 \times \text{F1@95}
+  \text{Instance Score} = 0.25 \times F1_{0.25} + 0.5 \times F1_{0.50:0.90:0.05} + 0.25 \times F1_{0.95}
   $$
 
 2) Semantic foreground quality is measured using `semantic_object_mIoU`:
