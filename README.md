@@ -157,9 +157,10 @@ We will evaluate the generated test data using two metrics: 1) instance segmenta
 
 - For each threshold $\tau$, compute:
 
-    ```math
-    F1_{\tau} = \frac{2 TP_{\tau}}{2 TP_{\tau} + FP_{\tau} + FN_{\tau}}
-    ```
+  ```math
+  F1_{\tau} = \frac{2 TP_{\tau}}{2 TP_{\tau} + FP_{\tau} + FN_{\tau}}
+  ```
+
   where $TP_\tau$, $FP_\tau$, and $FN_\tau$ are aggregated over all scenes.
 
 - We report:
@@ -169,18 +170,18 @@ We will evaluate the generated test data using two metrics: 1) instance segmenta
 
 - Final instance score:
 
-    ```math
-    \text{Instance Score} = 0.25 \times F1_{0.25} + 0.5 \times F1_{0.50:0.90:0.05} + 0.25 \times F1_{0.95}
-    ```
+  ```math
+  \text{Instance Score} = 0.25 \times F1_{0.25} + 0.5 \times F1_{0.50:0.90:0.05} + 0.25 \times F1_{0.95}
+  ```
 
 2) Semantic foreground quality is measured using `semantic_object_mIoU`:
 
-    ```math
-    \text{Semantic Score}
-    =
-    \frac{\sum_i \mathbf{1}[y_{\mathrm{pred},i} > 0 \land y_{\mathrm{gt},i} > 0]}
-    {\sum_i \mathbf{1}[y_{\mathrm{pred},i} > 0 \lor y_{\mathrm{gt},i} > 0]}
-    ```
+  ```math
+  \text{Semantic Score}
+  =
+  \frac{\sum_i \mathbf{1}[y_{\mathrm{pred},i} > 0 \land y_{\mathrm{gt},i} > 0]}
+  {\sum_i \mathbf{1}[y_{\mathrm{pred},i} > 0 \lor y_{\mathrm{gt},i} > 0]}
+  ```
 
 More details about the evaluation metrics are provided in `evaluate.py`.
 
@@ -188,9 +189,9 @@ More details about the evaluation metrics are provided in `evaluate.py`.
 - Additionally, to help everyone gauge progress, there will be a [Mid-Term Evaluation](#mid-term-evaluation-submission-optional) where teams can submit intermediate results.
 - **Final grading will be determined relative to the best score achieved for each task.** Specifically, the score for each task is computed as follows:
 
-    ```math
-    \mathrm{Score} = \max\left(\cfrac{\mathrm{Your\,Score}}{\mathrm{Highest\,Score}} \times 8, 0\right)
-    ```
+  ```math
+  \mathrm{Score} = \max\left(\cfrac{\mathrm{Your\,Score}}{\mathrm{Highest\,Score}} \times 8, 0\right)
+  ```
 
 - If your score equals the highest score, you receive 8 points for that task.
 
