@@ -1,0 +1,7 @@
+*.pth
+*.glb
+*.npy
+*.ply
+*.jsonl
+
+__pycache__/

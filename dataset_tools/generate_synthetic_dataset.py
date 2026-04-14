@@ -113,6 +113,7 @@ class SceneData:
 class PlacedObject:
     instance_id: int
     mesh: trimesh.Trimesh
+    bounds: np.ndarray
     support_type: str
     support_parent: int | None
     anchor: np.ndarray
@@ -398,6 +399,24 @@ def _fits_scene_xy(bounds: np.ndarray, scene_bounds: np.ndarray, margin: float) 
     )
 
 
+def _aabb_overlaps(bounds_a: np.ndarray, bounds_b: np.ndarray) -> bool:
+    bounds_a = np.asarray(bounds_a, dtype=np.float64)
+    bounds_b = np.asarray(bounds_b, dtype=np.float64)
+    if bounds_a.shape != (2, 3) or bounds_b.shape != (2, 3):
+        raise ValueError(
+            f"Expected AABB bounds with shape [2, 3], got {bounds_a.shape} and {bounds_b.shape}"
+        )
+    separated = np.any(bounds_a[1] < bounds_b[0]) or np.any(bounds_b[1] < bounds_a[0])
+    return not separated
+
+
+def _collides_with_placed_objects(bounds: np.ndarray, placed_objects: Sequence[PlacedObject]) -> bool:
+    for placed_obj in placed_objects:
+        if _aabb_overlaps(bounds, placed_obj.bounds):
+            return True
+    return False
+
+
 def _convex_hull_planes(hull: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
     normals = np.asarray(hull.face_normals, dtype=np.float64)
     face_points = np.asarray(hull.vertices[hull.faces[:, 0]], dtype=np.float64)
@@ -489,6 +508,8 @@ def _place_object(
             continue
         if _count_scene_intrusions(scene=scene, hull=hull, bounds=bounds, support_type=support_type) >= MAX_INTRUSION_POINTS:
             continue
+        if _collides_with_placed_objects(bounds=bounds, placed_objects=placed_objects):
+            continue
 
         sampled = _sample_object_points(
             mesh=mesh,
@@ -499,6 +520,7 @@ def _place_object(
         return PlacedObject(
             instance_id=instance_id,
             mesh=mesh,
+            bounds=bounds.copy(),
             support_type=support_type,
             support_parent=support_parent,
             anchor=anchor.astype(np.float64),
@@ -650,7 +672,7 @@ def _synthesize_scene(
         fused_normal.append(obj_normal)
         fused_instance.append(obj_labels)
 
-        bounds = np.asarray(placed_obj.mesh.bounds, dtype=np.float64)
+        bounds = np.asarray(placed_obj.bounds, dtype=np.float64)
         object_manifest.append(
             {
                 "instance_id": placed_obj.instance_id,
