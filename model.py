@@ -1,12 +1,248 @@
+from __future__ import annotations
+
+import math
+import os
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import torch
 import torch.nn as nn
+import yaml
+from munch import Munch
 from scipy.spatial import cKDTree
 
+from softgroup.model import SoftGroup
+from softgroup.ops import voxelization_idx
+from softgroup.util import rle_decode
 
-class DummyModel(nn.Module):
-    """
-    Instance segmentation baseline model.
-    """
+MAX_ALLOWED_INSTANCE_ID = 100
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _default_config_candidates() -> list[Path]:
+    root = _repo_root()
+    return [
+        root / "configs" / "softgroup" / "nubzuki_multiscan_trainval_softgroup_2.yaml",
+        root / "configs" / "softgroup" / "softgroup_nubzuki.yaml",
+    ]
+
+
+def _find_config(config_path: str | os.PathLike[str] | None, ckpt_path: str | os.PathLike[str]) -> Path:
+    candidates: list[Path] = []
+    if config_path:
+        candidates.append(Path(config_path))
+
+    ckpt = Path(ckpt_path)
+    if ckpt.parent.is_dir():
+        candidates.extend(sorted(ckpt.parent.glob("*.yaml")))
+
+    candidates.extend(_default_config_candidates())
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        if not candidate.is_absolute():
+            candidate = _repo_root() / candidate
+        if candidate.is_file():
+            return candidate
+
+    checked = ", ".join(str(x) for x in candidates)
+    raise FileNotFoundError(f"Could not find a SoftGroup config. Checked: {checked}")
+
+
+def _load_config(path: Path) -> Munch:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = Munch.fromDict(yaml.safe_load(f))
+    cfg.model.test_cfg.eval_tasks = ["instance"]
+    return cfg
+
+
+def _strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if any(key.startswith("module.") for key in state_dict):
+        return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _load_softgroup_weights(model: nn.Module, ckpt_path: str | os.PathLike[str], device: torch.device) -> None:
+    del device
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        if "net" in checkpoint:
+            state_dict = checkpoint["net"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unsupported checkpoint format in {ckpt_path}")
+
+    state_dict = _strip_module_prefix(state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[model.py] Missing checkpoint keys: {len(missing)}")
+    if unexpected:
+        print(f"[model.py] Unexpected checkpoint keys: {len(unexpected)}")
+
+
+def _estimate_spacing_metric(xyz: np.ndarray, metric: str = "p05", sample_size: int = 5000) -> float:
+    if xyz.shape[0] < 2:
+        return 0.0
+    sample_size = min(int(sample_size), int(xyz.shape[0]))
+    rng = np.random.default_rng(0)
+    sample_idx = rng.choice(xyz.shape[0], size=sample_size, replace=False)
+    tree = cKDTree(xyz)
+    distances, _ = tree.query(xyz[sample_idx], k=2)
+    nn = np.asarray(distances[:, 1], dtype=np.float64)
+    nn = nn[np.isfinite(nn) & (nn > 1e-8)]
+    if nn.size == 0:
+        return 0.0
+    if metric == "min":
+        return float(nn.min())
+    if metric == "p05":
+        return float(np.quantile(nn, 0.05))
+    if metric == "p10":
+        return float(np.quantile(nn, 0.10))
+    if metric == "median":
+        return float(np.median(nn))
+    raise ValueError(f"Unsupported spacing metric: {metric}")
+
+
+def _rgb_to_softgroup(rgb: np.ndarray) -> np.ndarray:
+    rgb = np.asarray(rgb, dtype=np.float32)
+    if rgb.size == 0:
+        return rgb
+    if float(np.max(rgb)) <= 1.0:
+        rgb = rgb * 2.0 - 1.0
+    else:
+        rgb = rgb / 127.5 - 1.0
+    return np.clip(rgb, -1.0, 1.0).astype(np.float32)
+
+
+def _softgroup_test_rotation(xyz: np.ndarray) -> np.ndarray:
+    theta = 0.35 * math.pi
+    matrix = np.array(
+        [
+            [math.cos(theta), math.sin(theta), 0.0],
+            [-math.sin(theta), math.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return np.matmul(xyz, matrix).astype(np.float32)
+
+
+def _maybe_restore_spacing(xyz: np.ndarray, data_cfg: Munch) -> np.ndarray:
+    fixed_spacing_target = getattr(data_cfg, "fixed_spacing_target", None)
+    if fixed_spacing_target in (None, "", "null"):
+        return xyz
+    spacing = _estimate_spacing_metric(
+        xyz,
+        metric=getattr(data_cfg, "spacing_metric", "p05"),
+        sample_size=getattr(data_cfg, "spacing_sample_size", 5000),
+    )
+    if spacing <= 1e-8:
+        return xyz
+    return (xyz * np.float32(float(fixed_spacing_target) / spacing)).astype(np.float32)
+
+
+def _decode_instances_to_pointwise(pred_instances: list[dict[str, Any]], n_points: int) -> np.ndarray:
+    pointwise = np.zeros((n_points,), dtype=np.int64)
+    next_instance_id = 1
+    ordered = sorted(pred_instances, key=lambda item: float(item["conf"]), reverse=True)
+    for instance in ordered:
+        if next_instance_id > MAX_ALLOWED_INSTANCE_ID:
+            break
+        mask = rle_decode(instance["pred_mask"]).astype(bool)
+        if mask.shape[0] != n_points:
+            raise ValueError(f"Predicted mask length mismatch: expected {n_points}, got {mask.shape[0]}")
+        paste = np.logical_and(mask, pointwise == 0)
+        if np.any(paste):
+            pointwise[paste] = next_instance_id
+            next_instance_id += 1
+    return pointwise
+
+
+class SoftGroupChallengeModel(nn.Module):
+    """Challenge interface wrapper around the copied SoftGroup implementation."""
+
+    def __init__(self, cfg: Munch, device: torch.device):
+        super().__init__()
+        self.cfg = cfg
+        self.device = device
+        self.network = SoftGroup(**cfg.model).to(device)
+
+    def _build_single_batch(self, scene_features: torch.Tensor, scan_id: str) -> dict[str, Any]:
+        data_cfg = getattr(self.cfg.data, "test", Munch())
+        voxel_cfg = data_cfg.voxel_cfg
+
+        features_np = scene_features.detach().float().cpu().numpy()
+        if features_np.shape[0] < 6:
+            raise ValueError(f"Expected at least xyz+rgb channels [>=6, N], got {features_np.shape}")
+
+        xyz = np.ascontiguousarray(features_np[0:3, :].T, dtype=np.float32)
+        rgb = _rgb_to_softgroup(features_np[3:6, :].T)
+        xyz = _maybe_restore_spacing(xyz, data_cfg)
+
+        xyz_middle = _softgroup_test_rotation(xyz)
+        xyz_voxel = xyz_middle * np.float32(voxel_cfg.scale)
+        xyz_voxel = xyz_voxel - xyz_voxel.min(0)
+
+        n_points = xyz.shape[0]
+        coord = torch.from_numpy(xyz_voxel).long()
+        coord_float = torch.from_numpy(xyz_middle).float()
+        feat = torch.from_numpy(rgb).float()
+        semantic_label = torch.zeros(n_points, dtype=torch.long)
+        instance_label = torch.full((n_points,), -100, dtype=torch.long)
+        pt_offset_label = torch.full((n_points, 3), -100.0, dtype=torch.float32) - coord_float
+
+        coords = torch.cat([coord.new_zeros((coord.size(0), 1)), coord], dim=1).contiguous()
+        batch_idxs = coords[:, 0].int()
+        spatial_shape = np.clip(coords.max(0)[0][1:].numpy() + 1, voxel_cfg.spatial_shape[0], None)
+        voxel_coords, v2p_map, p2v_map = voxelization_idx(coords, 1)
+
+        return {
+            "scan_ids": [scan_id],
+            "coords": coords,
+            "batch_idxs": batch_idxs,
+            "voxel_coords": voxel_coords,
+            "p2v_map": p2v_map,
+            "v2p_map": v2p_map,
+            "coords_float": coord_float,
+            "feats": feat,
+            "semantic_labels": semantic_label,
+            "instance_labels": instance_label,
+            "instance_pointnum": torch.zeros((0,), dtype=torch.int),
+            "instance_cls": torch.zeros((0,), dtype=torch.long),
+            "pt_offset_labels": pt_offset_label,
+            "spatial_shape": spatial_shape,
+            "batch_size": 1,
+        }
+
+    @torch.inference_mode()
+    def predict_instances(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 3:
+            raise ValueError(f"Expected features shape [B, C, N], got {tuple(features.shape)}")
+        if not torch.cuda.is_available():
+            raise RuntimeError("SoftGroup inference requires CUDA and the compiled SoftGroup CUDA ops.")
+
+        self.network.eval()
+        predictions = []
+        for batch_idx in range(features.shape[0]):
+            batch = self._build_single_batch(features[batch_idx], scan_id=f"challenge_{batch_idx:04d}")
+            result = self.network(batch)
+            pointwise = _decode_instances_to_pointwise(result["pred_instances"], features.shape[2])
+            predictions.append(torch.from_numpy(pointwise))
+        return torch.stack(predictions, dim=0).to(device=features.device, dtype=torch.long)
 
 
 def initialize_model(
@@ -14,31 +250,30 @@ def initialize_model(
     device: torch.device,
     in_channels: int = 9,
     num_classes: int = 2,
+    config_path: str | None = None,
+    **_: Any,
 ) -> nn.Module:
-    model = DummyModel.to(device)
+    del in_channels, num_classes
+    if device.type == "cuda":
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        torch.cuda.set_device(device.index)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+        torch.cuda.set_device(device.index)
+    else:
+        raise RuntimeError("SoftGroup requires CUDA; no CUDA device is available.")
 
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        checkpoint = checkpoint["state_dict"]
-    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        checkpoint = checkpoint["model_state_dict"]
-
-    if isinstance(checkpoint, dict) and any(k.startswith("module.") for k in checkpoint.keys()):
-        checkpoint = {k.replace("module.", "", 1): v for k, v in checkpoint.items()}
-
-    model.load_state_dict(checkpoint, strict=False)
+    cfg = _load_config(_find_config(config_path, ckpt_path))
+    model = SoftGroupChallengeModel(cfg, device=device)
+    _load_softgroup_weights(model.network, ckpt_path, device=device)
     model.eval()
     return model
 
 
-def run_inference(
-    model: nn.Module,
-    features: torch.Tensor,
-    **kwargs
-) -> torch.Tensor:
-    """
-    Returns per-point instance labels [B, N], background=0, instances start at 1.
-    """
-    
-
-    return torch.zeros_like(features[:, 0, :])
+def run_inference(model: nn.Module, features: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    """Return per-point instance labels [B, N], with 0 as background."""
+    del kwargs
+    if not hasattr(model, "predict_instances"):
+        raise TypeError("initialize_model() must return a SoftGroupChallengeModel-compatible object.")
+    return model.predict_instances(features)

@@ -1,58 +1,85 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import torch.optim as optim
-from tqdm import tqdm
+from __future__ import annotations
 
-# 1. 아까 설명한 데이터셋 불러오기
-from dataset import InstancePointCloudDataset
-# 2. 여러분이 짤 모델 불러오기
-from model import DummyModel
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
 
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import yaml
 
-    # [여기에 들어갑니다!] 데이터셋 초기화
-    # 미리 data_generator.py를 통해 data/train_scenes 폴더에 npy 파일들을 잔뜩 만들어 두어야 합니다.
-    train_dataset = InstancePointCloudDataset(data_dir="./data", split="train")
-    
-    # DataLoader를 이용해 배치(Batch) 단위로 쪼개기
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
+from tools.train import main as softgroup_train_main
 
-    # 모델 초기화 (DummyModel 안에 실제 네트워크 구조를 구현해야 함)
-    model = DummyModel().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    num_epochs = 50
+def _set_if_present(mapping: dict[str, Any], key: str, value: Any) -> None:
+    if value is not None:
+        mapping[key] = value
 
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
 
-        # 데이터 로더에서 배치 단위로 데이터 뽑기
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            # batch["features"]의 모양: [B, 9, N]
-            features = batch["features"].to(device)
-            # batch["instance_labels"]의 모양: [B, N]
-            gt_labels = batch["instance_labels"].to(device)
+def _write_config_with_overrides(args: argparse.Namespace, config_path: Path) -> Path:
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
 
-            optimizer.zero_grad()
+    if args.data_root is not None:
+        cfg["data"]["train"]["data_root"] = args.data_root
+        cfg["data"]["test"]["data_root"] = args.data_root
+    _set_if_present(cfg["data"]["train"], "prefix", args.train_prefix)
+    _set_if_present(cfg["data"]["test"], "prefix", args.val_prefix)
+    _set_if_present(cfg["dataloader"]["train"], "batch_size", args.batch_size)
+    _set_if_present(cfg["dataloader"]["train"], "num_workers", args.train_num_workers)
+    _set_if_present(cfg["dataloader"]["test"], "num_workers", args.test_num_workers)
+    _set_if_present(cfg["optimizer"], "lr", args.lr)
+    _set_if_present(cfg, "epochs", args.epochs)
+    _set_if_present(cfg, "step_epoch", args.step_epoch)
+    _set_if_present(cfg, "save_freq", args.save_freq)
 
-            # [주의!] 여기서 모델의 '학습용' forward를 호출해야 합니다.
-            # (model.py에 있는 run_inference 함수는 '평가용'이므로 학습할 땐 안 씁니다.)
-            pred_logits = model(features) 
+    if args.work_dir is not None:
+        cfg["work_dir"] = args.work_dir
 
-            # Loss 계산 (Semantic loss, Clustering loss 등 여러분이 설계)
-            # loss = compute_loss(pred_logits, gt_labels)
-            # loss.backward()
-            # optimizer.step()
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", prefix="nubzuki_train_", delete=False) as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+        return Path(f.name)
 
-            # total_loss += loss.item()
-        
-        # print(f"Epoch {epoch} Loss: {total_loss/len(train_loader)}")
 
-        # 체크포인트 저장 (이 저장된 파일을 나중에 initialize_model에서 부르게 됨)
-        # torch.save(model.state_dict(), f"best_model.pth")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train the Nubzuki SoftGroup model.")
+    parser.add_argument(
+        "--config",
+        default="configs/softgroup/softgroup_nubzuki.yaml",
+        help="SoftGroup YAML config to train from.",
+    )
+    parser.add_argument("--work-dir", default=None, help="Optional output work directory.")
+    parser.add_argument("--resume", default=None, help="Optional checkpoint to resume from.")
+    parser.add_argument("--skip-validate", action="store_true", help="Skip validation during training.")
+
+    parser.add_argument("--data-root", default=None, help="Override train/val .npy dataset root.")
+    parser.add_argument("--train-prefix", default=None, help="Override training split directory name.")
+    parser.add_argument("--val-prefix", default=None, help="Override validation split directory name.")
+    parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs.")
+    parser.add_argument("--step-epoch", type=int, default=None, help="Override LR schedule step epoch.")
+    parser.add_argument("--save-freq", type=int, default=None, help="Override checkpoint save frequency.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size.")
+    parser.add_argument("--train-num-workers", type=int, default=None, help="Override training workers.")
+    parser.add_argument("--test-num-workers", type=int, default=None, help="Override validation workers.")
+    parser.add_argument("--lr", type=float, default=None, help="Override learning rate.")
+    args = parser.parse_args()
+
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = Path(__file__).resolve().parent / config_path
+
+    forwarded_config = _write_config_with_overrides(args, config_path)
+    forwarded = ["tools/train.py", str(forwarded_config)]
+    if args.work_dir:
+        forwarded.extend(["--work_dir", args.work_dir])
+    if args.resume:
+        forwarded.extend(["--resume", args.resume])
+    if args.skip_validate:
+        forwarded.append("--skip_validate")
+
+    sys.argv = forwarded
+    softgroup_train_main()
+
 
 if __name__ == "__main__":
-    train()
+    main()

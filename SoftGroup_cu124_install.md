@@ -1,157 +1,219 @@
-# SoftGroup Environment Setup (CUDA 12.4 Only)
+# End-To-End SoftGroup CUDA 12.4 Install Guide
 
-This guide creates a **clean conda environment** for SoftGroup + spconv **locked to CUDA 12.4**.
-It avoids mixing CUDA versions, which can break spconv builds and runtime.
+This guide targets the challenge-local SoftGroup copy under:
 
-Important compatibility note:
-- The local [SoftGroup README](/home/ubuntu/JW/seg/SoftGroup/README.md:20) says the refactored code supports `pytorch 1.11` and `spconv 2.1`.
-- A CUDA 12.4 stack is therefore **outside the upstream-tested matrix** for this repo.
-- We can still construct a CUDA 12.4 environment, but if SoftGroup or spconv fails later, the next problem will be framework compatibility rather than Conda packaging.
+```text
+3DML_Segmentation-Comp./softgroup/
+```
 
-## Assumptions
-- You have a GPU driver compatible with CUDA 12.4.
-- You can use `conda`.
-- You can use the system CUDA 12.4 install (or a matching `pytorch-cuda=12.4` runtime).
+TA clarification: custom dependencies are allowed if we provide an end-to-end
+installation guide for the current environment, including CUDA, Python, PyTorch,
+and additional dependencies. Because SoftGroup requires custom CUDA/C++ ops, this
+guide includes the CUDA extension build step.
 
-## Recommended Environment
-### 1) Create and activate a new env
+## Validated Local Environment
+
+- Python `3.10`
+- PyTorch `2.5.1`
+- TorchVision `0.20.1`
+- TorchAudio `2.5.1`
+- CUDA runtime `12.4`
+- CUDA toolkit `12.4`
+- `spconv-cu124==2.3.8`
+- `numpy==2.0.1`
+- `scipy==1.15.3`
+- `pyyaml==6.0.3`
+- `munch==4.0.0`
+- `tensorboardX==2.6.5`
+- `tqdm==4.67.3`
+
+## 1. Create Conda Environment
+
 ```bash
 conda create -n softgroup-cu124 python=3.10 -y
 conda activate softgroup-cu124
 conda config --env --set channel_priority strict
 ```
 
-### 2) Install PyTorch with CUDA 12.4
-Use the official PyTorch and NVIDIA channels with the CUDA 12.4 runtime.
-Also pin MKL below `2024.1` to avoid the `iJIT_NotifyEvent` import issue seen with some Conda solves:
+## 2. Install PyTorch And CUDA 12.4 Toolkit
+
 ```bash
-conda install -y pytorch torchvision torchaudio pytorch-cuda=12.4 "mkl<2024.1" -c pytorch -c nvidia
+conda install -y \
+  pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  pytorch-cuda=12.4 cuda-toolkit=12.4 "mkl<2024.1" \
+  -c pytorch -c nvidia
 ```
 
-For building local CUDA extensions such as SoftGroup's ops, install the CUDA 12.4 toolkit too:
+Set build paths:
+
 ```bash
-conda install -y cuda-toolkit=12.4 -c nvidia
 export CUDA_HOME="$CONDA_PREFIX"
 export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
 ```
 
-Verify CUDA runtime version used by PyTorch:
+Verify:
+
 ```bash
 python - <<'PY'
 import torch
-print('torch', torch.__version__)
-print('cuda runtime', torch.version.cuda)
-print('cuda available', torch.cuda.is_available())
+print("torch", torch.__version__)
+print("cuda runtime", torch.version.cuda)
+print("cuda available", torch.cuda.is_available())
 PY
 ```
-Expected: `torch.version.cuda` shows `12.4`.
 
-### 3) Install spconv for CUDA 12.4
-Try a prebuilt wheel first. If it fails, build from source.
+Expected:
 
-**Option A: Prebuilt wheel (if available)**
+- `torch 2.5.1`
+- CUDA runtime `12.4`
+- CUDA available `True`
+
+## 3. Install Python Dependencies
+
+From the challenge repo root:
+
 ```bash
-pip install spconv-cu124
+cd /path/to/3DML_Segmentation-Comp.
+python -m pip install -r requirements-softgroup-cu124.txt
 ```
 
-**Option B: Build from source (CUDA 12.4)**
-```bash
-pip install spconv
-```
-If this fails, build spconv from source with your CUDA 12.4 toolkit installed and `CUDA_HOME` set.
+## 4. Install System Build Dependency
 
-### 4) Install SoftGroup dependencies
-```bash
-cd /home/ubuntu/JW/seg/SoftGroup
-pip install -r requirements.txt
-```
+SoftGroup ops use sparsehash headers.
 
-### 5) System build requirement (one-time)
-SoftGroup build requires sparsehash headers:
 ```bash
+sudo apt-get update
 sudo apt-get install -y libsparsehash-dev
 ```
-If you do not have sudo, install the package via your system admin or skip and report the error.
 
-### 6) Build and install SoftGroup
+If `sudo` is unavailable, install `libsparsehash-dev` through the system package
+manager or ask the environment maintainer to provide it.
+
+## 5. Build The SoftGroup CUDA Extension
+
+From the challenge repo root:
+
 ```bash
-cd /home/ubuntu/JW/seg/SoftGroup
+cd /path/to/3DML_Segmentation-Comp.
 export CUDA_HOME="$CONDA_PREFIX"
 export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
 python -m pip install -e . --no-build-isolation
 ```
 
-Why this command:
-- `setup.py build_ext develop` eventually delegates to editable install machinery that may use isolated build environments.
-- In this repo, that isolated build path can fail with `ModuleNotFoundError: No module named 'torch'`.
-- `pip install -e . --no-build-isolation` keeps the build inside the active env where `torch` is already installed.
+This builds and installs the local extension as:
 
-### 7) Sanity check imports
+```python
+softgroup.ops.ops
+```
+
+The generated binary should appear under `softgroup/ops/`, typically with a name
+like:
+
+```text
+ops.cpython-310-x86_64-linux-gnu.so
+```
+
+## 6. Sanity Check Imports
+
+Run from the challenge repo root:
+
 ```bash
 python - <<'PY'
 import torch
 import spconv.pytorch as spconv
+import softgroup
+from softgroup.ops import ops
 from softgroup.model import SoftGroup
-print('ok', torch.__version__)
+
+print("torch", torch.__version__)
+print("softgroup", softgroup.__file__)
+print("ops", ops.__file__)
+print("ok")
 PY
 ```
 
-## Notes
-- **Do not install any other CUDA version** in this environment.
-- If `spconv` fails to compile, re-check:
-  - `torch.version.cuda == 12.4`
-  - `nvcc --version` reports CUDA 12.4
-  - `CUDA_HOME` points to CUDA 12.4
-- If build fails with `CUDA_HOME environment variable is not set`, install `cuda-toolkit=12.4` in the env and set `CUDA_HOME="$CONDA_PREFIX"`.
-- If build fails with `fatal error: nv/target: No such file or directory`, export:
+Expected:
+
+- `softgroup` path points inside the submitted `3DML_Segmentation-Comp./softgroup`
+- `ops` imports successfully
+
+## 7. Functional Smoke Tests
+
+Compile-check Python files:
+
 ```bash
-export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
+python -m py_compile dataset.py evaluate.py model.py train.py tools/train.py tools/test.py tools/eval_nubzuki.py
 ```
-- This is needed because Conda's CUDA headers place `nv/target` under `targets/x86_64-linux/include`, while some builds only include `$CONDA_PREFIX/include`.
-- If editable install fails with `ModuleNotFoundError: No module named 'torch'`, use:
+
+Train initialization smoke:
+
+```bash
+python train.py \
+  --config configs/softgroup/softgroup_nubzuki.yaml \
+  --epochs 0 \
+  --work-dir /tmp/nubzuki_train_smoke \
+  --skip-validate
+```
+
+Evaluation smoke, once `checkpoints/best.pth` exists:
+
+```bash
+python evaluate.py \
+  --test-data-dir data/nubzuki_multiscan_trainval_npy/val \
+  --ckpt-path checkpoints/best.pth \
+  --output-dir /tmp/nubzuki_eval_smoke
+```
+
+## Notes For Submission
+
+- The four intended Python entry points are:
+  - `dataset.py`
+  - `evaluate.py`
+  - `model.py`
+  - `train.py`
+- No bash wrapper is required.
+- `evaluate.py` loads the model through `model.initialize_model()`.
+- The checkpoint should be placed at:
+
+```text
+checkpoints/best.pth
+```
+
+## Troubleshooting
+
+### `ModuleNotFoundError: softgroup.ops.ops`
+
+The CUDA extension was not built or is not on the import path. Rerun:
+
 ```bash
 python -m pip install -e . --no-build-isolation
 ```
 
-## Troubleshooting
-### ImportError: undefined symbol `iJIT_NotifyEvent`
-This is usually a Conda runtime-linking issue around MKL / Intel ITT, not a fully corrupted env.
+from the challenge repo root.
 
-Check whether `libittnotify.so` is missing:
+### `CUDA_HOME environment variable is not set`
+
+Run:
+
 ```bash
-conda activate softgroup-cu124
-find "$CONDA_PREFIX" -type f -name 'libittnotify.so*'
+export CUDA_HOME="$CONDA_PREFIX"
 ```
 
-If nothing is found, the most reliable fix is to downgrade MKL and refresh the PyTorch solve:
+### `fatal error: nv/target: No such file or directory`
+
+Run:
+
 ```bash
-conda install -y pytorch torchvision torchaudio pytorch-cuda=12.4 "mkl<2024.1" -c pytorch -c nvidia
+export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
 ```
 
-If you want to repair the current env in place, try:
+### `ImportError: undefined symbol iJIT_NotifyEvent`
+
+This is usually an MKL/Intel runtime issue. Reinstall the pinned PyTorch stack:
+
 ```bash
-conda activate softgroup-cu124
-conda install -y "mkl<2024.1"
+conda install -y \
+  pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  pytorch-cuda=12.4 cuda-toolkit=12.4 "mkl<2024.1" \
+  -c pytorch -c nvidia
 ```
-
-Then rerun:
-```bash
-python - <<'PY'
-import torch
-print('torch', torch.__version__)
-print('cuda runtime', torch.version.cuda)
-print('cuda available', torch.cuda.is_available())
-PY
-```
-
-If the symbol error still remains after downgrading MKL, recreate the env from scratch with the pinned install command above. That is usually faster and cleaner than fighting a partially solved Conda state.
-
-## Optional: Add project utilities
-If you want to run the dataset tools in this env:
-```bash
-pip install numpy trimesh matplotlib
-```
-
----
-
-If you want me to execute these steps, tell me the environment name you want to use.

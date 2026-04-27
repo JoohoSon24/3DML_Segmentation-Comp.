@@ -1,0 +1,14 @@
+spconv-cu124==2.3.8
+cumm-cu124==0.7.11
+numpy==2.0.1
+scipy==1.15.3
+munch==4.0.0
+pyyaml==6.0.3
+tqdm==4.67.3
+tensorboard==2.20.0
+tensorboardX==2.6.5
+plyfile
+pandas
+scikit-learn
+trimesh
+matplotlib

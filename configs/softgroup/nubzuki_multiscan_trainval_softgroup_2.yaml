@@ -1,0 +1,85 @@
+model:
+  channels: 32
+  num_blocks: 7
+  semantic_classes: 2
+  instance_classes: 1
+  sem2ins_classes: []
+  semantic_only: false
+  ignore_label: -100
+  with_coords: true
+  grouping_cfg:
+    score_thr: 0.2
+    radius: 0.03
+    mean_active: 300
+    class_numpoint_mean:
+    - -1.0
+    - 1244.5714285714287
+    npoint_thr: 0.05
+    ignore_classes:
+    - 0
+  instance_voxel_cfg:
+    scale: 128
+    spatial_shape: 20
+  train_cfg:
+    max_proposal_num: 200
+    pos_iou_thr: 0.5
+  test_cfg:
+    x4_split: false
+    cls_score_thr: 0.001
+    mask_score_thr: -0.5
+    min_npoint: 50
+    eval_tasks:
+    - instance
+  fixed_modules: []
+data:
+  train:
+    type: nubzuki
+    data_root: /home/ubuntu/JW/seg/3DML_Segmentation-Comp./data/nubzuki_multiscan_trainval_npy
+    prefix: train
+    suffix: .npy
+    training: true
+    repeat: 1
+    aug_prob: 1.0
+    use_normalized_coords: true
+    fixed_spacing_target: 0.014
+    spacing_metric: p05
+    voxel_cfg:
+      scale: 128
+      spatial_shape:
+      - 128
+      - 512
+      max_npoint: 250000
+      min_npoint: 2000
+  test:
+    type: nubzuki
+    data_root: /home/ubuntu/JW/seg/3DML_Segmentation-Comp./data/nubzuki_multiscan_trainval_npy
+    prefix: val
+    suffix: .npy
+    training: false
+    with_label: true
+    use_normalized_coords: true
+    fixed_spacing_target: 0.014
+    spacing_metric: p05
+    voxel_cfg:
+      scale: 128
+      spatial_shape:
+      - 128
+      - 512
+      max_npoint: 250000
+      min_npoint: 2000
+dataloader:
+  train:
+    batch_size: 2
+    num_workers: 4
+  test:
+    batch_size: 1
+    num_workers: 1
+optimizer:
+  type: Adam
+  lr: 0.001
+fp16: false
+epochs: 96
+step_epoch: 48
+save_freq: 4
+pretrain: ''
+work_dir: /home/ubuntu/JW/seg/3DML_Segmentation-Comp./work_dirs/nubzuki_multiscan_trainval_softgroup_2
