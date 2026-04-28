@@ -70,19 +70,40 @@ SPACING_RELAXATION_FACTOR = 0.8
 MAX_SPACING_RELAXATION_STEPS = 4
 OBJECT_POSITION_JITTER_RATIO = 0.0
 NORMAL_JITTER_RANGE = (0.0, 0.003)
-COLOR_GAIN_RANGE = (0.85, 1.15)
-COLOR_OFFSET_RANGE = (-18.0, 18.0)
+HSV_SAT_SCALE_RANGE = (0.8, 1.2)
+HSV_VAL_SCALE_RANGE = (0.85, 1.15)
+HSV_MIN_SATURATION = 0.18
 COLOR_POINT_STD = 0.5
 SCENE_SUPPORT_NORMAL_Z = 0.35
 SCENE_SUPPORT_TOP_QUANTILE = 0.55
-OBJECT_TOP_BAND_RATIO = 0.15
-STACK_ON_OBJECT_PROB = 0.65
+LAYOUT_MODE_NAMES = ("scene_only", "mixed", "stack_heavy")
+LAYOUT_MODE_PROBS = np.array((0.35, 0.45, 0.20), dtype=np.float64)
+LAYOUT_MODE_BASE_STACK_PROBS = {
+    "scene_only": 0.0,
+    "mixed": 0.55,
+    "stack_heavy": 0.85,
+}
+LAYOUT_MODE_EXTRA_STACK_PROBS = {
+    "scene_only": 0.0,
+    "mixed": 0.25,
+    "stack_heavy": 0.55,
+}
+STACK_STYLE_NAMES = ("centered", "edge_overhang", "corner_overhang")
+STACK_STYLE_PROBS = np.array((0.40, 0.40, 0.20), dtype=np.float64)
+STACK_CHILD_MIN_OVERLAP_RATIO = 0.10
+STACK_CENTER_JITTER_RATIO = 0.30
+STACK_EDGE_OVERLAP_RATIO_RANGE = (0.20, 0.60)
+STACK_CORNER_OVERLAP_RATIO_RANGE = (0.35, 0.70)
+STACK_STYLE_SAMPLE_ATTEMPTS = 20
 MAX_PLACEMENT_ATTEMPTS = 64
+SCENE_SYNTHESIS_MAX_RETRIES = 5
 SCENE_MARGIN_RATIO = 0.01
 SUPPORT_CONTACT_HEIGHT_RATIO = 0.06
 SUPPORT_CONTACT_SCENE_RATIO = 0.008
+OBJECT_SUPPORT_CLEARANCE_RATIO = 0.10
 COLLISION_QUERY_MARGIN_RATIO = 0.01
 MAX_INTRUSION_POINTS = 12
+AABB_PENETRATION_EPS_RATIO = 1e-5
 DEBUG_Y_UP_TRANSFORM = np.array(
     [
         [1.0, 0.0, 0.0, 0.0],
@@ -116,6 +137,8 @@ class PlacedObject:
     bounds: np.ndarray
     support_type: str
     support_parent: int | None
+    placement_style: str
+    support_xy_overlap_ratio: float
     anchor: np.ndarray
     jitter_xy: np.ndarray
     rotation_deg: np.ndarray
@@ -126,8 +149,9 @@ class PlacedObject:
     spacing_ratio: float
     raw_vertex_count: int
     final_object_count: int
-    color_gain: np.ndarray
-    color_offset: np.ndarray
+    color_hue_shift_deg: float
+    color_sat_scale: float
+    color_val_scale: float
 
 
 def _repo_root() -> Path:
@@ -321,17 +345,53 @@ def _scene_support_anchor(scene: SceneData, rng: np.random.Generator) -> np.ndar
     return scene.xyz[idx].astype(np.float64)
 
 
-def _object_support_anchor(parent_mesh: trimesh.Trimesh, rng: np.random.Generator) -> np.ndarray:
-    vertices = np.asarray(parent_mesh.vertices, dtype=np.float64)
-    z_max = float(vertices[:, 2].max())
-    z_min = float(vertices[:, 2].min())
-    band = max((z_max - z_min) * OBJECT_TOP_BAND_RATIO, 1e-6)
-    top_idx = np.flatnonzero(vertices[:, 2] >= (z_max - band))
-    if len(top_idx) == 0:
-        idx = int(np.argmax(vertices[:, 2]))
+def _sample_weighted_choice(options: Sequence[str], probabilities: np.ndarray, rng: np.random.Generator) -> str:
+    index = int(rng.choice(len(options), p=probabilities))
+    return str(options[index])
+
+
+def _sample_layout_mode(target_insertions: int, rng: np.random.Generator) -> str:
+    if target_insertions < 2:
+        return "scene_only"
+    return _sample_weighted_choice(LAYOUT_MODE_NAMES, LAYOUT_MODE_PROBS, rng=rng)
+
+
+def _desired_stack_count(layout_mode: str, target_insertions: int) -> int:
+    if layout_mode == "scene_only" or target_insertions < 2:
+        return 0
+    if layout_mode == "mixed":
+        return 1
+    return 2 if target_insertions >= 3 else 1
+
+
+def _support_mode_order(
+    layout_mode: str,
+    placed_count: int,
+    target_insertions: int,
+    stacked_count: int,
+    rng: np.random.Generator,
+) -> tuple[str, ...]:
+    if placed_count == 0:
+        return ("scene",)
+    if layout_mode == "scene_only":
+        return ("scene",)
+
+    desired_stack_count = _desired_stack_count(layout_mode=layout_mode, target_insertions=target_insertions)
+    remaining_objects = target_insertions - placed_count
+    remaining_stack_needed = max(desired_stack_count - stacked_count, 0)
+
+    if remaining_stack_needed > 0 and remaining_objects <= remaining_stack_needed:
+        preferred = "object"
     else:
-        idx = int(rng.choice(top_idx))
-    return vertices[idx]
+        prefer_prob = (
+            LAYOUT_MODE_BASE_STACK_PROBS[layout_mode]
+            if remaining_stack_needed > 0
+            else LAYOUT_MODE_EXTRA_STACK_PROBS[layout_mode]
+        )
+        preferred = "object" if rng.random() < prefer_prob else "scene"
+
+    alternate = "scene" if preferred == "object" else "object"
+    return (preferred, alternate)
 
 
 def _randomized_object_mesh(
@@ -375,19 +435,90 @@ def _randomized_object_mesh(
     )
 
 
+def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
+    rgb = np.asarray(rgb, dtype=np.float32)
+    rgb = np.clip(rgb, 0.0, 255.0) / 255.0
+    maxc = rgb.max(axis=1)
+    minc = rgb.min(axis=1)
+    delta = maxc - minc
+
+    hsv = np.zeros_like(rgb, dtype=np.float32)
+    hsv[:, 2] = maxc
+
+    nonzero = maxc > 1e-8
+    hsv[nonzero, 1] = delta[nonzero] / maxc[nonzero]
+
+    colorful = delta > 1e-8
+    if np.any(colorful):
+        r = rgb[:, 0]
+        g = rgb[:, 1]
+        b = rgb[:, 2]
+
+        mask_r = colorful & (maxc == r)
+        mask_g = colorful & (maxc == g)
+        mask_b = colorful & (maxc == b)
+
+        hsv[mask_r, 0] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6.0
+        hsv[mask_g, 0] = ((b[mask_g] - r[mask_g]) / delta[mask_g]) + 2.0
+        hsv[mask_b, 0] = ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4.0
+        hsv[colorful, 0] = (hsv[colorful, 0] / 6.0) % 1.0
+    return hsv
+
+
+def _hsv_to_rgb_uint8(hsv: np.ndarray) -> np.ndarray:
+    hsv = np.asarray(hsv, dtype=np.float32)
+    h = np.mod(hsv[:, 0], 1.0)
+    s = np.clip(hsv[:, 1], 0.0, 1.0)
+    v = np.clip(hsv[:, 2], 0.0, 1.0)
+
+    scaled = h * 6.0
+    sector = np.floor(scaled).astype(np.int32)
+    frac = scaled - sector
+
+    p = v * (1.0 - s)
+    q = v * (1.0 - frac * s)
+    t = v * (1.0 - (1.0 - frac) * s)
+
+    rgb = np.empty((h.shape[0], 3), dtype=np.float32)
+    idx = sector % 6
+
+    mask = idx == 0
+    rgb[mask] = np.stack([v[mask], t[mask], p[mask]], axis=1)
+    mask = idx == 1
+    rgb[mask] = np.stack([q[mask], v[mask], p[mask]], axis=1)
+    mask = idx == 2
+    rgb[mask] = np.stack([p[mask], v[mask], t[mask]], axis=1)
+    mask = idx == 3
+    rgb[mask] = np.stack([p[mask], q[mask], v[mask]], axis=1)
+    mask = idx == 4
+    rgb[mask] = np.stack([t[mask], p[mask], v[mask]], axis=1)
+    mask = idx == 5
+    rgb[mask] = np.stack([v[mask], p[mask], q[mask]], axis=1)
+
+    return np.clip(np.rint(rgb * 255.0), 0.0, 255.0).astype(np.uint8)
+
+
 def _apply_color_jitter_to_mesh(
     mesh: trimesh.Trimesh,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[float, float, float]:
     colors = np.asarray(mesh.visual.vertex_colors, dtype=np.uint8).copy()
-    rgb = colors[:, :3].astype(np.float32)
-    gain = rng.uniform(COLOR_GAIN_RANGE[0], COLOR_GAIN_RANGE[1], size=3).astype(np.float32)
-    offset = rng.uniform(COLOR_OFFSET_RANGE[0], COLOR_OFFSET_RANGE[1], size=3).astype(np.float32)
-    rgb = rgb * gain[None, :] + offset[None, :]
-    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-    colors[:, :3] = rgb
+    rgb = colors[:, :3]
+    if rgb.shape[0] == 0:
+        return 0.0, 1.0, 1.0
+
+    hsv = _rgb_to_hsv(rgb)
+    hue_shift_deg = float(rng.uniform(0.0, 360.0))
+    sat_scale = float(rng.uniform(HSV_SAT_SCALE_RANGE[0], HSV_SAT_SCALE_RANGE[1]))
+    val_scale = float(rng.uniform(HSV_VAL_SCALE_RANGE[0], HSV_VAL_SCALE_RANGE[1]))
+
+    hsv[:, 0] = np.mod(hsv[:, 0] + np.float32(hue_shift_deg / 360.0), 1.0)
+    hsv[:, 1] = np.clip(np.maximum(hsv[:, 1], HSV_MIN_SATURATION) * sat_scale, 0.0, 1.0)
+    hsv[:, 2] = np.clip(hsv[:, 2] * val_scale, 0.0, 1.0)
+
+    colors[:, :3] = _hsv_to_rgb_uint8(hsv)
     mesh.visual.vertex_colors = colors
-    return gain.astype(np.float64), offset.astype(np.float64)
+    return hue_shift_deg, sat_scale, val_scale
 
 
 def _fits_scene_xy(bounds: np.ndarray, scene_bounds: np.ndarray, margin: float) -> bool:
@@ -399,20 +530,194 @@ def _fits_scene_xy(bounds: np.ndarray, scene_bounds: np.ndarray, margin: float) 
     )
 
 
-def _aabb_overlaps(bounds_a: np.ndarray, bounds_b: np.ndarray) -> bool:
+def _aabb_overlap_lengths(bounds_a: np.ndarray, bounds_b: np.ndarray) -> np.ndarray:
     bounds_a = np.asarray(bounds_a, dtype=np.float64)
     bounds_b = np.asarray(bounds_b, dtype=np.float64)
     if bounds_a.shape != (2, 3) or bounds_b.shape != (2, 3):
         raise ValueError(
             f"Expected AABB bounds with shape [2, 3], got {bounds_a.shape} and {bounds_b.shape}"
         )
-    separated = np.any(bounds_a[1] < bounds_b[0]) or np.any(bounds_b[1] < bounds_a[0])
-    return not separated
+    lower = np.maximum(bounds_a[0], bounds_b[0])
+    upper = np.minimum(bounds_a[1], bounds_b[1])
+    return np.maximum(0.0, upper - lower)
 
 
-def _collides_with_placed_objects(bounds: np.ndarray, placed_objects: Sequence[PlacedObject]) -> bool:
+def _penetration_epsilon(scene_diag: float) -> float:
+    return max(AABB_PENETRATION_EPS_RATIO * float(scene_diag), 1e-6)
+
+
+def _aabb_penetrates(bounds_a: np.ndarray, bounds_b: np.ndarray, eps: float) -> bool:
+    overlaps = _aabb_overlap_lengths(bounds_a, bounds_b)
+    return bool(np.all(overlaps > eps))
+
+
+def _xy_footprint_area(bounds: np.ndarray) -> float:
+    bounds = np.asarray(bounds, dtype=np.float64)
+    extent = np.maximum(bounds[1, :2] - bounds[0, :2], 1e-8)
+    return float(extent[0] * extent[1])
+
+
+def _xy_overlap_area(bounds_a: np.ndarray, bounds_b: np.ndarray) -> float:
+    overlaps = _aabb_overlap_lengths(bounds_a, bounds_b)
+    return float(overlaps[0] * overlaps[1])
+
+
+def _support_xy_overlap_ratio(child_bounds: np.ndarray, parent_bounds: np.ndarray) -> float:
+    child_area = _xy_footprint_area(child_bounds)
+    if child_area <= 1e-8:
+        return 0.0
+    return float(_xy_overlap_area(child_bounds, parent_bounds) / child_area)
+
+
+def _max_support_xy_overlap_ratio(parent_bounds: np.ndarray, child_bounds: np.ndarray) -> float:
+    parent_bounds = np.asarray(parent_bounds, dtype=np.float64)
+    child_bounds = np.asarray(child_bounds, dtype=np.float64)
+    parent_extent = np.maximum(parent_bounds[1, :2] - parent_bounds[0, :2], 1e-8)
+    child_extent = np.maximum(child_bounds[1, :2] - child_bounds[0, :2], 1e-8)
+    return float(min(1.0, parent_extent[0] / child_extent[0]) * min(1.0, parent_extent[1] / child_extent[1]))
+
+
+def _sample_support_parent(
+    child_bounds: np.ndarray,
+    placed_objects: Sequence[PlacedObject],
+    rng: np.random.Generator,
+) -> PlacedObject | None:
+    candidates: list[PlacedObject] = []
+    weights = []
     for placed_obj in placed_objects:
-        if _aabb_overlaps(bounds, placed_obj.bounds):
+        support_capacity = _max_support_xy_overlap_ratio(parent_bounds=placed_obj.bounds, child_bounds=child_bounds)
+        if support_capacity >= STACK_CHILD_MIN_OVERLAP_RATIO:
+            candidates.append(placed_obj)
+            weights.append(support_capacity)
+
+    if not candidates:
+        return None
+
+    weight_array = np.asarray(weights, dtype=np.float64)
+    weight_array = weight_array / np.maximum(weight_array.sum(), 1e-8)
+    index = int(rng.choice(len(candidates), p=weight_array))
+    return candidates[index]
+
+
+def _sample_overlap_fraction(max_fraction: float, fraction_range: tuple[float, float], rng: np.random.Generator) -> float:
+    max_fraction = float(max(max_fraction, 0.0))
+    if max_fraction <= 1e-6:
+        return 0.0
+    upper = min(float(fraction_range[1]), max_fraction)
+    lower = min(float(fraction_range[0]), upper)
+    if upper <= lower:
+        return upper
+    return float(rng.uniform(lower, upper))
+
+
+def _edge_center_from_overlap(
+    parent_min: float,
+    parent_max: float,
+    child_extent: float,
+    overlap_extent: float,
+    sign: float,
+) -> float:
+    if sign >= 0.0:
+        child_min = parent_max - overlap_extent
+        return float(child_min + 0.5 * child_extent)
+    child_max = parent_min + overlap_extent
+    return float(child_max - 0.5 * child_extent)
+
+
+def _sample_object_support_pose(
+    child_bounds: np.ndarray,
+    parent_bounds: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, float]:
+    child_bounds = np.asarray(child_bounds, dtype=np.float64)
+    parent_bounds = np.asarray(parent_bounds, dtype=np.float64)
+
+    parent_min_xy = parent_bounds[0, :2]
+    parent_max_xy = parent_bounds[1, :2]
+    parent_center_xy = 0.5 * (parent_min_xy + parent_max_xy)
+    parent_extent_xy = np.maximum(parent_max_xy - parent_min_xy, 1e-8)
+    child_extent_xy = np.maximum(child_bounds[1, :2] - child_bounds[0, :2], 1e-8)
+    parent_top_z = float(parent_bounds[1, 2])
+    anchor = np.array([parent_center_xy[0], parent_center_xy[1], parent_top_z], dtype=np.float64)
+
+    for _ in range(STACK_STYLE_SAMPLE_ATTEMPTS):
+        placement_style = _sample_weighted_choice(STACK_STYLE_NAMES, STACK_STYLE_PROBS, rng=rng)
+        center_xy = parent_center_xy.copy()
+
+        if placement_style == "centered":
+            jitter_scale = np.minimum(parent_extent_xy, child_extent_xy) * STACK_CENTER_JITTER_RATIO
+            center_xy = center_xy + rng.uniform(-jitter_scale, jitter_scale)
+        elif placement_style == "edge_overhang":
+            axis = int(rng.integers(0, 2))
+            sign = 1.0 if rng.random() < 0.5 else -1.0
+            primary_fraction = _sample_overlap_fraction(
+                max_fraction=min(1.0, parent_extent_xy[axis] / child_extent_xy[axis]),
+                fraction_range=STACK_EDGE_OVERLAP_RATIO_RANGE,
+                rng=rng,
+            )
+            center_xy[axis] = _edge_center_from_overlap(
+                parent_min=parent_min_xy[axis],
+                parent_max=parent_max_xy[axis],
+                child_extent=child_extent_xy[axis],
+                overlap_extent=primary_fraction * child_extent_xy[axis],
+                sign=sign,
+            )
+            other_axis = 1 - axis
+            other_jitter = np.minimum(parent_extent_xy[other_axis], child_extent_xy[other_axis]) * (
+                STACK_CENTER_JITTER_RATIO + 0.10
+            )
+            center_xy[other_axis] = center_xy[other_axis] + float(rng.uniform(-other_jitter, other_jitter))
+        else:
+            signs = np.where(rng.random(2) < 0.5, -1.0, 1.0)
+            for axis in range(2):
+                overlap_fraction = _sample_overlap_fraction(
+                    max_fraction=min(1.0, parent_extent_xy[axis] / child_extent_xy[axis]),
+                    fraction_range=STACK_CORNER_OVERLAP_RATIO_RANGE,
+                    rng=rng,
+                )
+                center_xy[axis] = _edge_center_from_overlap(
+                    parent_min=parent_min_xy[axis],
+                    parent_max=parent_max_xy[axis],
+                    child_extent=child_extent_xy[axis],
+                    overlap_extent=overlap_fraction * child_extent_xy[axis],
+                    sign=float(signs[axis]),
+                )
+
+        translation = np.array([center_xy[0], center_xy[1], parent_top_z], dtype=np.float64)
+        candidate_bounds = child_bounds + translation[None, :]
+        overlap_ratio = _support_xy_overlap_ratio(child_bounds=candidate_bounds, parent_bounds=parent_bounds)
+        if overlap_ratio >= STACK_CHILD_MIN_OVERLAP_RATIO:
+            jitter_xy = center_xy - parent_center_xy
+            return anchor, jitter_xy.astype(np.float64), translation, placement_style, float(overlap_ratio)
+
+    raise RuntimeError("Failed to sample a valid AABB-top object support pose.")
+
+
+def _validate_object_support(child_bounds: np.ndarray, parent_bounds: np.ndarray, scene_diag: float) -> float | None:
+    eps = _penetration_epsilon(scene_diag)
+    if abs(float(child_bounds[0, 2] - parent_bounds[1, 2])) > eps:
+        return None
+    if _aabb_penetrates(child_bounds, parent_bounds, eps=eps):
+        return None
+    overlap_ratio = _support_xy_overlap_ratio(child_bounds=child_bounds, parent_bounds=parent_bounds)
+    if overlap_ratio < STACK_CHILD_MIN_OVERLAP_RATIO:
+        return None
+    return float(overlap_ratio)
+
+
+def _collides_with_placed_objects(
+    bounds: np.ndarray,
+    placed_objects: Sequence[PlacedObject],
+    scene_diag: float,
+    support_parent: int | None,
+) -> bool:
+    eps = _penetration_epsilon(scene_diag)
+    for placed_obj in placed_objects:
+        if support_parent is not None and placed_obj.instance_id == support_parent:
+            if _aabb_penetrates(bounds, placed_obj.bounds, eps=eps):
+                return True
+            continue
+        if _aabb_penetrates(bounds, placed_obj.bounds, eps=eps):
             return True
     return False
 
@@ -445,7 +750,7 @@ def _count_scene_intrusions(
         SUPPORT_CONTACT_SCENE_RATIO * scene.scene_diag,
     )
     if support_type == "object":
-        support_clearance *= 0.5
+        support_clearance = max(support_clearance, OBJECT_SUPPORT_CLEARANCE_RATIO * object_height)
     nearby = nearby[nearby[:, 2] > float(bounds[0, 2] + support_clearance)]
     if nearby.shape[0] == 0:
         return 0
@@ -469,75 +774,117 @@ def _place_object(
     scene: SceneData,
     placed_objects: Sequence[PlacedObject],
     instance_id: int,
+    support_modes: Sequence[str],
     rng: np.random.Generator,
 ) -> tuple[PlacedObject, dict[str, np.ndarray | float]]:
     margin = SCENE_MARGIN_RATIO * float(scene.scene_diag)
+    support_modes = tuple(dict.fromkeys(support_modes))
+    attempts_per_mode = max(1, MAX_PLACEMENT_ATTEMPTS // max(len(support_modes), 1))
+    extra_attempts = MAX_PLACEMENT_ATTEMPTS % max(len(support_modes), 1)
 
-    for _ in range(MAX_PLACEMENT_ATTEMPTS):
-        mesh, hull, anisotropic_scale, rotation_deg, global_scale, diag_ratio = _randomized_object_mesh(
-            base_mesh=base_mesh,
-            base_hull=base_hull,
-            scene_diag=scene.scene_diag,
-            rng=rng,
-        )
-        color_gain, color_offset = _apply_color_jitter_to_mesh(mesh, rng=rng)
+    for mode_index, requested_support in enumerate(support_modes):
+        mode_attempts = attempts_per_mode + (1 if mode_index < extra_attempts else 0)
+        for _ in range(mode_attempts):
+            mesh, hull, anisotropic_scale, rotation_deg, global_scale, diag_ratio = _randomized_object_mesh(
+                base_mesh=base_mesh,
+                base_hull=base_hull,
+                scene_diag=scene.scene_diag,
+                rng=rng,
+            )
+            child_bounds_local = np.asarray(mesh.bounds, dtype=np.float64).copy()
+            color_hue_shift_deg, color_sat_scale, color_val_scale = _apply_color_jitter_to_mesh(mesh, rng=rng)
 
-        support_type = "scene"
-        support_parent = None
-        if placed_objects and rng.random() < STACK_ON_OBJECT_PROB:
-            support_parent_obj = placed_objects[int(rng.integers(0, len(placed_objects)))]
-            anchor = _object_support_anchor(support_parent_obj.mesh, rng=rng)
-            support_type = "object"
-            support_parent = support_parent_obj.instance_id
-        else:
-            anchor = _scene_support_anchor(scene, rng=rng)
+            support_type = requested_support
+            support_parent = None
+            support_xy_overlap_ratio = 0.0
 
-        half_extent_xy = 0.5 * np.maximum(mesh.bounds[1, :2] - mesh.bounds[0, :2], 1e-6)
-        jitter_limit = 0.98 * half_extent_xy
-        jitter_xy = rng.uniform(-jitter_limit, jitter_limit)
+            if support_type == "object":
+                support_parent_obj = _sample_support_parent(
+                    child_bounds=child_bounds_local,
+                    placed_objects=placed_objects,
+                    rng=rng,
+                )
+                if support_parent_obj is None:
+                    continue
+                try:
+                    anchor, jitter_xy, translation, placement_style, support_xy_overlap_ratio = _sample_object_support_pose(
+                        child_bounds=child_bounds_local,
+                        parent_bounds=support_parent_obj.bounds,
+                        rng=rng,
+                    )
+                except RuntimeError:
+                    continue
+                support_parent = support_parent_obj.instance_id
+            else:
+                support_type = "scene"
+                placement_style = "scene_support"
+                anchor = _scene_support_anchor(scene, rng=rng)
+                half_extent_xy = 0.5 * np.maximum(child_bounds_local[1, :2] - child_bounds_local[0, :2], 1e-6)
+                jitter_limit = 0.98 * half_extent_xy
+                jitter_xy = rng.uniform(-jitter_limit, jitter_limit)
+                translation = np.array([anchor[0], anchor[1], anchor[2]], dtype=np.float64)
+                translation[:2] += jitter_xy
 
-        translation = np.array([anchor[0], anchor[1], anchor[2]], dtype=np.float64)
-        translation[:2] += jitter_xy
-        mesh.apply_translation(translation)
-        hull.apply_translation(translation)
-        bounds = np.asarray(mesh.bounds, dtype=np.float64)
+            mesh.apply_translation(translation)
+            hull.apply_translation(translation)
+            bounds = np.asarray(mesh.bounds, dtype=np.float64)
 
-        if not _fits_scene_xy(bounds=bounds, scene_bounds=scene.bounds, margin=margin):
-            continue
-        if bounds[0, 2] < float(scene.bounds[0, 2] - margin):
-            continue
-        if _count_scene_intrusions(scene=scene, hull=hull, bounds=bounds, support_type=support_type) >= MAX_INTRUSION_POINTS:
-            continue
-        if _collides_with_placed_objects(bounds=bounds, placed_objects=placed_objects):
-            continue
+            if not _fits_scene_xy(bounds=bounds, scene_bounds=scene.bounds, margin=margin):
+                continue
+            if bounds[0, 2] < float(scene.bounds[0, 2] - margin):
+                continue
+            if support_type == "object":
+                support_parent_obj = next(obj for obj in placed_objects if obj.instance_id == support_parent)
+                validated_overlap_ratio = _validate_object_support(
+                    child_bounds=bounds,
+                    parent_bounds=support_parent_obj.bounds,
+                    scene_diag=scene.scene_diag,
+                )
+                if validated_overlap_ratio is None:
+                    continue
+                support_xy_overlap_ratio = float(validated_overlap_ratio)
+            if _count_scene_intrusions(scene=scene, hull=hull, bounds=bounds, support_type=support_type) >= MAX_INTRUSION_POINTS:
+                continue
+            if _collides_with_placed_objects(
+                bounds=bounds,
+                placed_objects=placed_objects,
+                scene_diag=scene.scene_diag,
+                support_parent=support_parent,
+            ):
+                continue
 
-        sampled = _sample_object_points(
-            mesh=mesh,
-            scene_point_spacing=scene.point_spacing,
-            rng=rng,
-        )
+            sampled = _sample_object_points(
+                mesh=mesh,
+                scene_point_spacing=scene.point_spacing,
+                rng=rng,
+            )
 
-        return PlacedObject(
-            instance_id=instance_id,
-            mesh=mesh,
-            bounds=bounds.copy(),
-            support_type=support_type,
-            support_parent=support_parent,
-            anchor=anchor.astype(np.float64),
-            jitter_xy=jitter_xy.astype(np.float64),
-            rotation_deg=rotation_deg,
-            anisotropic_scale=anisotropic_scale,
-            global_scale=global_scale,
-            diag_ratio=diag_ratio,
-            target_point_spacing=float(sampled["target_point_spacing"]),
-            spacing_ratio=float(sampled["spacing_ratio"]),
-            raw_vertex_count=int(sampled["raw_vertex_count"]),
-            final_object_count=int(sampled["xyz"].shape[0]),
-            color_gain=color_gain,
-            color_offset=color_offset,
-        ), sampled
+            return PlacedObject(
+                instance_id=instance_id,
+                mesh=mesh,
+                bounds=bounds.copy(),
+                support_type=support_type,
+                support_parent=support_parent,
+                placement_style=placement_style,
+                support_xy_overlap_ratio=float(support_xy_overlap_ratio),
+                anchor=anchor.astype(np.float64),
+                jitter_xy=jitter_xy.astype(np.float64),
+                rotation_deg=rotation_deg,
+                anisotropic_scale=anisotropic_scale,
+                global_scale=global_scale,
+                diag_ratio=diag_ratio,
+                target_point_spacing=float(sampled["target_point_spacing"]),
+                spacing_ratio=float(sampled["spacing_ratio"]),
+                raw_vertex_count=int(sampled["raw_vertex_count"]),
+                final_object_count=int(sampled["xyz"].shape[0]),
+                color_hue_shift_deg=float(color_hue_shift_deg),
+                color_sat_scale=float(color_sat_scale),
+                color_val_scale=float(color_val_scale),
+            ), sampled
 
-    raise RuntimeError(f"Failed to place object {instance_id} after {MAX_PLACEMENT_ATTEMPTS} attempts.")
+    raise RuntimeError(
+        f"Failed to place object {instance_id} after {MAX_PLACEMENT_ATTEMPTS} attempts with support_modes={support_modes}."
+    )
 
 
 def _sample_object_points(
@@ -613,6 +960,48 @@ def _voxel_downsample_indices(
     return keep.astype(np.int64)
 
 
+def _synthesize_scene_layout(
+    scene: SceneData,
+    base_mesh: trimesh.Trimesh,
+    base_hull: trimesh.Trimesh,
+    target_insertions: int,
+    layout_mode: str,
+    rng: np.random.Generator,
+) -> tuple[list[PlacedObject], list[dict[str, np.ndarray | float]], int]:
+    placed_objects: list[PlacedObject] = []
+    sampled_objects: list[dict[str, np.ndarray | float]] = []
+    stacked_count = 0
+
+    for instance_id in range(1, target_insertions + 1):
+        support_modes = _support_mode_order(
+            layout_mode=layout_mode,
+            placed_count=len(placed_objects),
+            target_insertions=target_insertions,
+            stacked_count=stacked_count,
+            rng=rng,
+        )
+        placed_obj, sampled = _place_object(
+            base_mesh=base_mesh,
+            base_hull=base_hull,
+            scene=scene,
+            placed_objects=placed_objects,
+            instance_id=instance_id,
+            support_modes=support_modes,
+            rng=rng,
+        )
+        placed_objects.append(placed_obj)
+        sampled_objects.append(sampled)
+        if placed_obj.support_type == "object":
+            stacked_count += 1
+
+    desired_stack_count = _desired_stack_count(layout_mode=layout_mode, target_insertions=target_insertions)
+    if stacked_count < desired_stack_count:
+        raise RuntimeError(
+            f"Layout mode {layout_mode} only produced {stacked_count} stacked placements out of {desired_stack_count}."
+        )
+    return placed_objects, sampled_objects, stacked_count
+
+
 def _synthesize_scene(
     scene_path: Path,
     base_mesh: trimesh.Trimesh,
@@ -625,35 +1014,35 @@ def _synthesize_scene(
     scene = _load_scene_data(scene_path)
 
     target_insertions = int(rng.integers(MIN_INSERTIONS, MAX_INSERTIONS + 1))
+    layout_mode = _sample_layout_mode(target_insertions=target_insertions, rng=rng)
+
     placed_objects: list[PlacedObject] = []
     sampled_objects: list[dict[str, np.ndarray | float]] = []
+    stacked_count = 0
+    effective_seed = int(scene_seed)
+    retry_index = 0
+    last_error: RuntimeError | None = None
 
-    instance_id = 1
-    total_attempt_rounds = 0
-    max_total_attempt_rounds = MAX_INSERTIONS * MAX_PLACEMENT_ATTEMPTS * 2
-
-    while len(placed_objects) < target_insertions and total_attempt_rounds < max_total_attempt_rounds:
-        total_attempt_rounds += 1
+    for retry_index in range(SCENE_SYNTHESIS_MAX_RETRIES):
+        effective_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+        attempt_rng = np.random.default_rng(effective_seed)
         try:
-            placed_obj, sampled = _place_object(
+            placed_objects, sampled_objects, stacked_count = _synthesize_scene_layout(
+                scene=scene,
                 base_mesh=base_mesh,
                 base_hull=base_hull,
-                scene=scene,
-                placed_objects=placed_objects,
-                instance_id=instance_id,
-                rng=rng,
+                target_insertions=target_insertions,
+                layout_mode=layout_mode,
+                rng=attempt_rng,
             )
-        except RuntimeError:
-            if len(placed_objects) == 0:
-                continue
             break
-
-        placed_objects.append(placed_obj)
-        sampled_objects.append(sampled)
-        instance_id += 1
-
-    if len(placed_objects) == 0:
-        raise RuntimeError(f"Unable to synthesize any object placements for scene: {scene_path}")
+        except RuntimeError as exc:
+            last_error = exc
+    else:
+        raise RuntimeError(
+            f"Unable to synthesize {target_insertions} objects for scene {scene_path} "
+            f"after {SCENE_SYNTHESIS_MAX_RETRIES} attempts in layout_mode={layout_mode}: {last_error}"
+        )
 
     fused_xyz = [scene.xyz.astype(np.float32)]
     fused_rgb = [scene.rgb.astype(np.uint8)]
@@ -678,6 +1067,8 @@ def _synthesize_scene(
                 "instance_id": placed_obj.instance_id,
                 "support_type": placed_obj.support_type,
                 "support_parent": placed_obj.support_parent,
+                "placement_style": placed_obj.placement_style,
+                "support_xy_overlap_ratio": placed_obj.support_xy_overlap_ratio,
                 "anchor": placed_obj.anchor.tolist(),
                 "jitter_xy": placed_obj.jitter_xy.tolist(),
                 "anisotropic_scale": placed_obj.anisotropic_scale.tolist(),
@@ -691,8 +1082,9 @@ def _synthesize_scene(
                 "spacing_ratio_to_scene": placed_obj.spacing_ratio,
                 "raw_vertex_count": placed_obj.raw_vertex_count,
                 "final_point_count": placed_obj.final_object_count,
-                "color_gain": placed_obj.color_gain.tolist(),
-                "color_offset": placed_obj.color_offset.tolist(),
+                "color_hue_shift_deg": placed_obj.color_hue_shift_deg,
+                "color_sat_scale": placed_obj.color_sat_scale,
+                "color_val_scale": placed_obj.color_val_scale,
             }
         )
 
@@ -716,13 +1108,16 @@ def _synthesize_scene(
 
     manifest_entry = {
         "source_scene": str(scene_path.resolve()),
-        "effective_seed": int(scene_seed),
+        "effective_seed": int(effective_seed),
         "scene_diag": float(scene.scene_diag),
         "scene_point_spacing": float(scene.point_spacing),
         "scene_bounds_min": scene.bounds[0].tolist(),
         "scene_bounds_max": scene.bounds[1].tolist(),
+        "layout_mode": layout_mode,
+        "scene_retry_index": int(retry_index),
         "requested_object_count": int(target_insertions),
         "placed_object_count": int(len(placed_objects)),
+        "stacked_object_count": int(stacked_count),
         "objects": object_manifest,
     }
     return output, manifest_entry
