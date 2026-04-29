@@ -41,7 +41,7 @@ data:
     repeat: 1
     aug_prob: 1.0
     use_normalized_coords: true
-    fixed_spacing_target: 0.014
+    fixed_spacing_target: 0.013616
     spacing_metric: p05
     voxel_cfg:
       scale: 128
@@ -58,7 +58,7 @@ data:
     training: false
     with_label: true
     use_normalized_coords: true
-    fixed_spacing_target: 0.014
+    fixed_spacing_target: 0.013616
     spacing_metric: p05
     voxel_cfg:
       scale: 128

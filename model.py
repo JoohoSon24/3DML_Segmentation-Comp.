@@ -12,7 +12,7 @@ import yaml
 from munch import Munch
 from scipy.spatial import cKDTree
 
-from softgroup.data.nubzuki import (_load_npy_dict as _load_raw_scene_dict, _normalize_xyz,
+from softgroup.data.nubzuki import (_load_npy_dict as _load_raw_scene_dict,
                                     _prepare_labels, _prepare_rgb)
 from softgroup.model import SoftGroup
 from softgroup.ops import voxelization_idx
@@ -270,8 +270,6 @@ class SoftGroupChallengeModel(nn.Module):
 
         raw = _load_raw_scene_dict(os.fspath(scene_path))
         xyz = np.asarray(raw["xyz"], dtype=np.float32)
-        if getattr(data_cfg, "use_normalized_coords", False):
-            xyz = _normalize_xyz(xyz)
         xyz = _maybe_restore_spacing(xyz, data_cfg)
         rgb = _prepare_rgb(raw["rgb"])
 
