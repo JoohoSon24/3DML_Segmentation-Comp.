@@ -12,6 +12,8 @@ import yaml
 from munch import Munch
 from scipy.spatial import cKDTree
 
+from softgroup.data.nubzuki import (_load_npy_dict as _load_raw_scene_dict, _normalize_xyz,
+                                    _prepare_labels, _prepare_rgb)
 from softgroup.model import SoftGroup
 from softgroup.ops import voxelization_idx
 from softgroup.util import rle_decode
@@ -136,9 +138,9 @@ def _softgroup_test_rotation(xyz: np.ndarray) -> np.ndarray:
             [-math.sin(theta), math.cos(theta), 0.0],
             [0.0, 0.0, 1.0],
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
-    return np.matmul(xyz, matrix).astype(np.float32)
+    return np.matmul(np.asarray(xyz, dtype=np.float64), matrix)
 
 
 def _maybe_restore_spacing(xyz: np.ndarray, data_cfg: Munch) -> np.ndarray:
@@ -172,6 +174,36 @@ def _decode_instances_to_pointwise(pred_instances: list[dict[str, Any]], n_point
     return pointwise
 
 
+def _get_cropped_inst_label(instance_label: np.ndarray, valid_idxs: np.ndarray) -> np.ndarray:
+    instance_label = instance_label[valid_idxs]
+    j = 0
+    while j < instance_label.max():
+        if len(np.where(instance_label == j)[0]) == 0:
+            instance_label[instance_label == instance_label.max()] = j
+        j += 1
+    return instance_label
+
+
+def _get_instance_info(
+    xyz: np.ndarray,
+    instance_label: np.ndarray,
+    semantic_label: np.ndarray,
+) -> tuple[int, list[int], list[int], np.ndarray]:
+    pt_mean = np.ones((xyz.shape[0], 3), dtype=np.float32) * -100.0
+    instance_pointnum = []
+    instance_cls = []
+    instance_num = max(int(instance_label.max()) + 1, 0)
+    for instance_id in range(instance_num):
+        inst_idx = np.where(instance_label == instance_id)
+        xyz_inst = xyz[inst_idx]
+        pt_mean[inst_idx] = xyz_inst.mean(0)
+        instance_pointnum.append(inst_idx[0].size)
+        cls_idx = inst_idx[0][0]
+        instance_cls.append(int(semantic_label[cls_idx]))
+    pt_offset_label = pt_mean - xyz
+    return instance_num, instance_pointnum, instance_cls, pt_offset_label
+
+
 class SoftGroupChallengeModel(nn.Module):
     """Challenge interface wrapper around the copied SoftGroup implementation."""
 
@@ -194,12 +226,12 @@ class SoftGroupChallengeModel(nn.Module):
         xyz = _maybe_restore_spacing(xyz, data_cfg)
 
         xyz_middle = _softgroup_test_rotation(xyz)
-        xyz_voxel = xyz_middle * np.float32(voxel_cfg.scale)
+        xyz_voxel = xyz_middle * float(voxel_cfg.scale)
         xyz_voxel = xyz_voxel - xyz_voxel.min(0)
 
         n_points = xyz.shape[0]
         coord = torch.from_numpy(xyz_voxel).long()
-        coord_float = torch.from_numpy(xyz_middle).float()
+        coord_float = torch.from_numpy(xyz_middle.astype(np.float32)).float()
         feat = torch.from_numpy(rgb).float()
         semantic_label = torch.zeros(n_points, dtype=torch.long)
         instance_label = torch.full((n_points,), -100, dtype=torch.long)
@@ -228,17 +260,105 @@ class SoftGroupChallengeModel(nn.Module):
             "batch_size": 1,
         }
 
+    def _build_single_batch_from_scene_path(
+        self,
+        scene_path: str | os.PathLike[str],
+        scan_id: str,
+    ) -> dict[str, Any]:
+        data_cfg = getattr(self.cfg.data, "test", Munch())
+        voxel_cfg = data_cfg.voxel_cfg
+
+        raw = _load_raw_scene_dict(os.fspath(scene_path))
+        xyz = np.asarray(raw["xyz"], dtype=np.float32)
+        if getattr(data_cfg, "use_normalized_coords", False):
+            xyz = _normalize_xyz(xyz)
+        xyz = _maybe_restore_spacing(xyz, data_cfg)
+        rgb = _prepare_rgb(raw["rgb"])
+
+        if "instance_labels" in raw:
+            semantic_label, instance_label = _prepare_labels(raw["instance_labels"])
+        else:
+            semantic_label = np.zeros(xyz.shape[0], dtype=np.int64)
+            instance_label = np.full(xyz.shape[0], -100, dtype=np.int64)
+
+        xyz_middle = _softgroup_test_rotation(xyz)
+        xyz_voxel = xyz_middle * float(voxel_cfg.scale)
+        xyz_voxel = xyz_voxel - xyz_voxel.min(0)
+        valid_idxs = np.ones(xyz_voxel.shape[0], dtype=bool)
+        instance_label = _get_cropped_inst_label(instance_label, valid_idxs)
+        inst_num, inst_pointnum, inst_cls, pt_offset_label = _get_instance_info(
+            xyz_middle,
+            instance_label.astype(np.int32),
+            semantic_label,
+        )
+
+        coord = torch.from_numpy(xyz_voxel).long()
+        coord_float = torch.from_numpy(xyz_middle).to(torch.float32)
+        feat = torch.from_numpy(rgb).float()
+        semantic_label_t = torch.from_numpy(semantic_label)
+        instance_label_t = torch.from_numpy(instance_label)
+        instance_pointnum_t = torch.tensor(inst_pointnum, dtype=torch.int)
+        instance_cls_t = torch.tensor(
+            [cls - 1 if cls != -100 else cls for cls in inst_cls],
+            dtype=torch.long,
+        )
+        pt_offset_label_t = torch.from_numpy(pt_offset_label).float()
+
+        coords = torch.cat([coord.new_zeros((coord.size(0), 1)), coord], dim=1).contiguous()
+        batch_idxs = coords[:, 0].int()
+        spatial_shape = np.clip(coords.max(0)[0][1:].numpy() + 1, voxel_cfg.spatial_shape[0], None)
+        voxel_coords, v2p_map, p2v_map = voxelization_idx(coords, 1)
+
+        return {
+            "scan_ids": [scan_id],
+            "coords": coords,
+            "batch_idxs": batch_idxs,
+            "voxel_coords": voxel_coords,
+            "p2v_map": p2v_map,
+            "v2p_map": v2p_map,
+            "coords_float": coord_float,
+            "feats": feat,
+            "semantic_labels": semantic_label_t,
+            "instance_labels": instance_label_t,
+            "instance_pointnum": instance_pointnum_t,
+            "instance_cls": instance_cls_t,
+            "pt_offset_labels": pt_offset_label_t,
+            "spatial_shape": spatial_shape,
+            "batch_size": 1,
+        }
+
     @torch.inference_mode()
-    def predict_instances(self, features: torch.Tensor) -> torch.Tensor:
+    def predict_instances(
+        self,
+        features: torch.Tensor,
+        scene_paths: str | os.PathLike[str] | list[str | os.PathLike[str]] | None = None,
+    ) -> torch.Tensor:
         if features.ndim != 3:
             raise ValueError(f"Expected features shape [B, C, N], got {tuple(features.shape)}")
         if not torch.cuda.is_available():
             raise RuntimeError("SoftGroup inference requires CUDA and the compiled SoftGroup CUDA ops.")
 
+        if scene_paths is None:
+            resolved_scene_paths: list[str | os.PathLike[str] | None] = [None] * features.shape[0]
+        elif isinstance(scene_paths, (str, os.PathLike)):
+            resolved_scene_paths = [scene_paths]
+        else:
+            resolved_scene_paths = list(scene_paths)
+        if len(resolved_scene_paths) != features.shape[0]:
+            raise ValueError(
+                f"Expected {features.shape[0]} scene paths, got {len(resolved_scene_paths)}"
+            )
+
         self.network.eval()
         predictions = []
         for batch_idx in range(features.shape[0]):
-            batch = self._build_single_batch(features[batch_idx], scan_id=f"challenge_{batch_idx:04d}")
+            scan_id = f"challenge_{batch_idx:04d}"
+            if resolved_scene_paths[batch_idx] is not None:
+                scene_path = resolved_scene_paths[batch_idx]
+                scan_id = Path(os.fspath(scene_path)).stem
+                batch = self._build_single_batch_from_scene_path(scene_path, scan_id=scan_id)
+            else:
+                batch = self._build_single_batch(features[batch_idx], scan_id=scan_id)
             result = self.network(batch)
             pointwise = _decode_instances_to_pointwise(result["pred_instances"], features.shape[2])
             predictions.append(torch.from_numpy(pointwise))
@@ -273,7 +393,9 @@ def initialize_model(
 
 def run_inference(model: nn.Module, features: torch.Tensor, **kwargs: Any) -> torch.Tensor:
     """Return per-point instance labels [B, N], with 0 as background."""
-    del kwargs
     if not hasattr(model, "predict_instances"):
         raise TypeError("initialize_model() must return a SoftGroupChallengeModel-compatible object.")
-    return model.predict_instances(features)
+    scene_paths = kwargs.pop("scene_path", None)
+    if scene_paths is None:
+        scene_paths = kwargs.pop("scene_paths", None)
+    return model.predict_instances(features, scene_paths=scene_paths)

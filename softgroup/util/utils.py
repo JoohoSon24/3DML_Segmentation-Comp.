@@ -1,6 +1,5 @@
 import functools
 import os
-import os.path as osp
 from collections import OrderedDict
 from math import cos, pi
 
@@ -85,27 +84,29 @@ def weights_to_cpu(state_dict):
     return state_dict_cpu
 
 
-@master_only
-def checkpoint_save(epoch, model, optimizer, work_dir, save_freq=16):
+def build_checkpoint(model, optimizer, epoch, meta=None):
     if hasattr(model, 'module'):
         model = model.module
-    f = os.path.join(work_dir, f'epoch_{epoch}.pth')
     checkpoint = {
         'net': weights_to_cpu(model.state_dict()),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch
     }
-    torch.save(checkpoint, f)
-    if os.path.exists(f'{work_dir}/latest.pth'):
-        os.remove(f'{work_dir}/latest.pth')
-    os.system(f'cd {work_dir}; ln -s {osp.basename(f)} latest.pth')
+    if meta:
+        checkpoint['meta'] = meta
+    return checkpoint
 
-    # remove previous checkpoints unless they are a power of 2 or a multiple of save_freq
-    epoch = epoch - 1
-    f = os.path.join(work_dir, f'epoch_{epoch}.pth')
-    if os.path.isfile(f):
-        if not is_multiple(epoch, save_freq) and not is_power2(epoch):
-            os.remove(f)
+
+@master_only
+def checkpoint_save_path(model, optimizer, path, epoch, meta=None):
+    torch.save(build_checkpoint(model, optimizer, epoch, meta=meta), path)
+
+
+@master_only
+def checkpoint_save(epoch, model, optimizer, work_dir, save_freq=16):
+    del save_freq
+    latest_path = os.path.join(work_dir, 'latest.pth')
+    checkpoint_save_path(model, optimizer, latest_path, epoch)
 
 
 def load_checkpoint(checkpoint, logger, model, optimizer=None, strict=False):

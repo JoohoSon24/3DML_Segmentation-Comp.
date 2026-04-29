@@ -3,9 +3,11 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 setup(
-    name="nubzuki-softgroup",
-    version="0.1.0",
-    description="Challenge-local SoftGroup integration for Nubzuki instance segmentation",
+    name='softgroup',
+    version='1.0',
+    description='SoftGroup: SoftGroup for 3D Instance Segmentation [CVPR 2022]',
+    author='Thang Vu',
+    author_email='thangvubk@kaist.ac.kr',
     packages=find_packages(include=("softgroup", "softgroup.*")),
     ext_modules=[
         CUDAExtension(

@@ -3,6 +3,7 @@
 *.npy
 *.ply
 *.jsonl
+*.png
 
 __pycache__/
 
