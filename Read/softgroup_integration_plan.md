@@ -2,7 +2,7 @@
 
 ## Goal
 
-Use the local `seg/SoftGroup` implementation to test whether a full 3D instance-segmentation pipeline can outperform the current placeholder baseline for the Nubzuki challenge, while keeping a path toward the official challenge interface in `model.py` and `evaluate.py`.
+Use the local `third_party/SoftGroup` implementation to test whether a full 3D instance-segmentation pipeline can outperform the current placeholder baseline for the Nubzuki challenge, while keeping a path toward the official challenge interface in `model.py` and `evaluate.py`.
 
 I see two targets:
 
@@ -30,7 +30,7 @@ The first target should come first. It is lower risk, and it tells us whether th
     - `instance_labels`
 - The generator already assumes the `softgroup-cu124` environment for geometry tooling.
 - The local MultiScan OIS dataset is present at:
-  - `seg/multiscan/dataset/object_instance_segmentation`
+  - `../data/object_instance_segmentation`
 - Available local scene counts are:
   - `train`: 174 `.pth`
   - `val`: 42 `.pth`
@@ -47,17 +47,17 @@ The first target should come first. It is lower risk, and it tells us whether th
 ### SoftGroup readiness in this workspace
 
 - The SoftGroup repo is already cloned at:
-  - `seg/SoftGroup`
+  - `third_party/SoftGroup`
 - The requested environment exists:
-  - `softgroup-cu124`
+  - `3d-seg2`
 - Confirmed usable packages in that env:
   - `python 3.10.19`
-  - `torch 2.5.1`
-  - `spconv-cu124 2.3.8`
-  - `numpy 2.0.1`
+  - `torch 2.7.1`
+  - `spconv-cu126`
+  - `numpy 2.2.6`
   - `scipy 1.15.3`
-  - `trimesh 4.11.5`
-- `import softgroup` succeeds in `softgroup-cu124`.
+  - `trimesh 4.12.2`
+- `import softgroup` succeeds in `softgroup-cu126`.
 - `from softgroup.ops import ops` also succeeds, which means the custom compiled SoftGroup ops are already available in the current env.
 
 My current conclusion is that the environment and third-party code are ready enough for integration work. The missing pieces are mostly data-contract wiring, config, and challenge-interface adaptation.

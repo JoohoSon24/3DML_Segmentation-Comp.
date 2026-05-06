@@ -62,12 +62,8 @@ MAX_INSERTIONS = 5
 ANISOTROPIC_SCALE_RANGE = (0.5, 1.5)
 ROTATION_RANGE_DEG = (-180.0, 180.0)
 SCENE_DIAG_RATIO_RANGE = (0.025, 0.2)
-POINT_COUNT_RANGE = (2048, 32768)
 SCENE_SPACING_SAMPLE_SIZE = 5000
-MIN_OBJECT_POINTS = 512
-OBJECT_POINT_SPACING_RATIO_RANGE = (0.10, 0.30)
-SPACING_RELAXATION_FACTOR = 0.8
-MAX_SPACING_RELAXATION_STEPS = 4
+OBJECT_SAMPLE_COUNT_RANGE = (3000, 26000)
 OBJECT_POSITION_JITTER_RATIO = 0.0
 NORMAL_JITTER_RANGE = (0.0, 0.003)
 COLOR_GAIN_RANGE = (0.85, 1.15)
@@ -122,9 +118,7 @@ class PlacedObject:
     anisotropic_scale: np.ndarray
     global_scale: float
     diag_ratio: float
-    target_point_spacing: float
-    spacing_ratio: float
-    raw_vertex_count: int
+    sample_count: int
     final_object_count: int
     color_gain: np.ndarray
     color_offset: np.ndarray
@@ -143,7 +137,7 @@ def _default_mesh_path() -> Path:
 
 
 def _default_output_dir() -> Path:
-    return _repo_root() / "data"
+    return _repo_root() / "data" / "synth_v3"
 
 
 def _torch_load(path: Path):
@@ -513,7 +507,6 @@ def _place_object(
 
         sampled = _sample_object_points(
             mesh=mesh,
-            scene_point_spacing=scene.point_spacing,
             rng=rng,
         )
 
@@ -529,9 +522,7 @@ def _place_object(
             anisotropic_scale=anisotropic_scale,
             global_scale=global_scale,
             diag_ratio=diag_ratio,
-            target_point_spacing=float(sampled["target_point_spacing"]),
-            spacing_ratio=float(sampled["spacing_ratio"]),
-            raw_vertex_count=int(sampled["raw_vertex_count"]),
+            sample_count=int(sampled["sample_count"]),
             final_object_count=int(sampled["xyz"].shape[0]),
             color_gain=color_gain,
             color_offset=color_offset,
@@ -542,42 +533,30 @@ def _place_object(
 
 def _sample_object_points(
     mesh: trimesh.Trimesh,
-    scene_point_spacing: float,
     rng: np.random.Generator,
 ) -> dict[str, np.ndarray | float]:
-    # MultiScan OIS scene points come directly from cleaned mesh vertices, so we mirror that
-    # representation here by using transformed object mesh vertices and spacing-aware thinning.
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    normals = _normalize_vectors(np.asarray(mesh.vertex_normals, dtype=np.float32))
-    colors = np.asarray(mesh.visual.vertex_colors[:, :3], dtype=np.uint8)
+    count = int(rng.integers(OBJECT_SAMPLE_COUNT_RANGE[0], OBJECT_SAMPLE_COUNT_RANGE[1] + 1))
 
-    spacing_ratio = float(rng.uniform(OBJECT_POINT_SPACING_RATIO_RANGE[0], OBJECT_POINT_SPACING_RATIO_RANGE[1]))
-    target_spacing = max(float(scene_point_spacing) * spacing_ratio, 1e-4)
-    actual_spacing = target_spacing
-    keep_indices = _voxel_downsample_indices(points=vertices, voxel_size=actual_spacing)
-    relax_steps = 0
-    while (
-        vertices.shape[0] > MIN_OBJECT_POINTS
-        and keep_indices.shape[0] < MIN_OBJECT_POINTS
-        and relax_steps < MAX_SPACING_RELAXATION_STEPS
-    ):
-        actual_spacing = max(actual_spacing * SPACING_RELAXATION_FACTOR, 1e-4)
-        keep_indices = _voxel_downsample_indices(points=vertices, voxel_size=actual_spacing)
-        relax_steps += 1
+    # Sample random points on triangle surfaces (barycentric sampling)
+    seed_val = int(rng.integers(0, 2**31))
+    points, face_indices = trimesh.sample.sample_surface(mesh, count, seed=seed_val)
+    points = np.asarray(points, dtype=np.float32)
+    face_indices = np.asarray(face_indices)
 
-    points = vertices[keep_indices]
-    normals = normals[keep_indices]
-    colors = colors[keep_indices].astype(np.float32)
+    # Smooth normals via barycentric interpolation
+    tris = np.asarray(mesh.triangles[face_indices], dtype=np.float32)
+    bary = trimesh.triangles.points_to_barycentric(tris, points)
+    bary = np.clip(bary, 0.0, None)
+    bary = bary / np.maximum(bary.sum(axis=1, keepdims=True), 1e-8)
+    fi = mesh.faces[face_indices]
+    vn = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    normals = _normalize_vectors(
+        bary[:, 0:1] * vn[fi[:, 0]] + bary[:, 1:2] * vn[fi[:, 1]] + bary[:, 2:3] * vn[fi[:, 2]]
+    )
 
-    if points.shape[0] > POINT_COUNT_RANGE[1]:
-        subsample_idx = rng.choice(points.shape[0], size=POINT_COUNT_RANGE[1], replace=False)
-        points = points[subsample_idx]
-        normals = normals[subsample_idx]
-        colors = colors[subsample_idx]
-
-    if OBJECT_POSITION_JITTER_RATIO > 0.0:
-        position_sigma = max(actual_spacing * OBJECT_POSITION_JITTER_RATIO, 1e-5)
-        points = points + rng.normal(0.0, position_sigma, size=points.shape).astype(np.float32)
+    # Color via barycentric interpolation
+    vc = np.asarray(mesh.visual.vertex_colors[:, :3], dtype=np.float32)
+    colors = (bary[:, 0:1] * vc[fi[:, 0]] + bary[:, 1:2] * vc[fi[:, 1]] + bary[:, 2:3] * vc[fi[:, 2]])
 
     normal_jitter = float(rng.uniform(NORMAL_JITTER_RANGE[0], NORMAL_JITTER_RANGE[1]))
     if normal_jitter > 0.0:
@@ -589,12 +568,10 @@ def _sample_object_points(
     colors = np.clip(colors, 0.0, 255.0).astype(np.uint8)
 
     return {
-        "xyz": points.astype(np.float32),
-        "normal": normals.astype(np.float32),
-        "rgb": colors.astype(np.uint8),
-        "target_point_spacing": float(actual_spacing),
-        "spacing_ratio": float(spacing_ratio),
-        "raw_vertex_count": int(vertices.shape[0]),
+        "xyz": points,
+        "normal": normals,
+        "rgb": colors,
+        "sample_count": count,
     }
 
 
@@ -687,9 +664,7 @@ def _synthesize_scene(
                 "mesh_bounds_min": bounds[0].tolist(),
                 "mesh_bounds_max": bounds[1].tolist(),
                 "mesh_diagonal": float(np.linalg.norm(bounds[1] - bounds[0])),
-                "target_point_spacing": placed_obj.target_point_spacing,
-                "spacing_ratio_to_scene": placed_obj.spacing_ratio,
-                "raw_vertex_count": placed_obj.raw_vertex_count,
+                "sample_count": placed_obj.sample_count,
                 "final_point_count": placed_obj.final_object_count,
                 "color_gain": placed_obj.color_gain.tolist(),
                 "color_offset": placed_obj.color_offset.tolist(),
