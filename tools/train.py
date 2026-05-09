@@ -258,7 +258,7 @@ def main():
     best_metric_score = None
     best_metric_value = None
     if osp.isfile(best_metric_path):
-        best_state = torch.load(best_metric_path, map_location='cpu')
+        best_state = torch.load(best_metric_path, map_location='cpu', weights_only=False)
         best_meta = best_state.get('meta', {})
         best_metric_name = best_meta.get('best_metric_name')
         best_metric_value = best_meta.get('best_metric_value')

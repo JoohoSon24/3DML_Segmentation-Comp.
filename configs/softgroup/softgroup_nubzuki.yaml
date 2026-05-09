@@ -13,7 +13,7 @@ model:
     mean_active: 300
     class_numpoint_mean:
     - -1.0
-    - 1244.5714285714287
+    - 14615.8  # updated from 1244.57 (old sparse sampling) to match actual train data avg
     npoint_thr: 0.05
     ignore_classes:
     - 0
@@ -42,13 +42,13 @@ data:
     aug_prob: 1.0
     use_normalized_coords: true
     fixed_spacing_target: 0.013616
-    spacing_metric: p05
+    spacing_metric: median
     voxel_cfg:
       scale: 128
       spatial_shape:
       - 128
       - 512
-      max_npoint: 250000
+      max_npoint: 380000
       min_npoint: 2000
   test:
     type: nubzuki
@@ -59,18 +59,18 @@ data:
     with_label: true
     use_normalized_coords: true
     fixed_spacing_target: 0.013616
-    spacing_metric: p05
+    spacing_metric: median
     voxel_cfg:
       scale: 128
       spatial_shape:
       - 128
       - 512
-      max_npoint: 250000
+      max_npoint: 380000
       min_npoint: 2000
 dataloader:
   train:
-    batch_size: 2
-    num_workers: 4
+    batch_size: 1
+    num_workers: 2
   test:
     batch_size: 1
     num_workers: 1

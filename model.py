@@ -28,8 +28,8 @@ def _repo_root() -> Path:
 def _default_config_candidates() -> list[Path]:
     root = _repo_root()
     return [
-        root / "configs" / "softgroup" / "nubzuki_multiscan_trainval_softgroup_2.yaml",
         root / "configs" / "softgroup" / "softgroup_nubzuki.yaml",
+        root / "configs" / "softgroup" / "nubzuki_multiscan_trainval_softgroup_2.yaml",
     ]
 
 
@@ -38,11 +38,11 @@ def _find_config(config_path: str | os.PathLike[str] | None, ckpt_path: str | os
     if config_path:
         candidates.append(Path(config_path))
 
+    candidates.extend(_default_config_candidates())
+
     ckpt = Path(ckpt_path)
     if ckpt.parent.is_dir():
         candidates.extend(sorted(ckpt.parent.glob("*.yaml")))
-
-    candidates.extend(_default_config_candidates())
     for candidate in candidates:
         candidate = candidate.expanduser()
         if not candidate.is_absolute():
